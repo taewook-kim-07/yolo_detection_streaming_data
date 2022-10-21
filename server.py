@@ -2,8 +2,9 @@ import argparse
 import asyncio
 import json, logging, os, ssl, uuid
 import numpy as np
-import cv2, torch
+import cv2
 import time
+import torch, torchvision
 
 from aiohttp import web
 from av import VideoFrame
@@ -18,18 +19,47 @@ pcs = set()
 relay = MediaRelay()
 
 m_channel = dict()
-mask_model = torch.hub.load("ultralytics/yolov5", "custom", path="v5_1017_1_best.pt", force_reload=True)
+mask_model = torch.hub.load("ultralytics/yolov5", "custom", path="v5_1017_1_best.pt")#, force_reload=True)
 
-def plot_boxes(results, frame):
-    for i in range(len(results)):
-        row = results.loc[i, :].values.tolist()
-        if row[4] >= 0.30:
+def nms(boxes):
+    def iou(box1, box2):
+        intersection_x_length = min(box1[2], box2[2]) - max(box1[0], box2[0])
+        intersection_y_length = min(box1[3], box2[3]) - max(box1[1], box2[1])
+        overlap = intersection_x_length * intersection_y_length
+        union = ((box1[2] - box1[0]) * (box1[3] - box1[1])) + ((box2[2] - box2[0]) * (box2[3] - box2[1])) - overlap
+        return overlap / union
+
+    remove_index = []
+    for i in range(len(boxes)):
+        for j in range(len(boxes)):
+            if i == j: continue
+            if j in remove_index:
+                continue
+
+            calc = iou( (int(boxes[i][0]), int(boxes[i][1]), int(boxes[i][2]), int(boxes[i][3])),
+                        (int(boxes[j][0]), int(boxes[j][1]), int(boxes[j][2]), int(boxes[j][3])) )
+            if calc > 0.85:
+                if boxes[i][4] > boxes[j][4]:
+                    remove_index.append(j)
+                else:
+                    remove_index.append(i)
+                    break
+
+    for i in set(remove_index):
+        del boxes[i]
+    return boxes
+
+def plot_boxes(predicts, frame):
+    for row in predicts:
+        if row[4] >= 0.1:
             x1, y1, x2, y2 = int(row[0]), int(row[1]), int(row[2]), int(row[3])
-            bgr = (0, 255, 0)
+
+            rgb = (0, 255, 0)
             if row[5] == 1:
-                bgr = (0, 0, 255)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), bgr, 2)
-            cv2.putText(frame, row[6], (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.9, bgr, 2)
+                rgb = (255, 0, 0)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), rgb, 2)
+            cv2.putText(frame, row[6], (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rgb, 2)
     return frame
 
 class VideoTransformTrack(MediaStreamTrack):
@@ -39,7 +69,7 @@ class VideoTransformTrack(MediaStreamTrack):
         super().__init__()  # don't forget this!
         self.track = track
         self.transform = transform
-        self.results = []
+        self.predict = []
         self.framecnt = 0
         self.uuid = uuid
 
@@ -47,17 +77,18 @@ class VideoTransformTrack(MediaStreamTrack):
         frame = await self.track.recv()
 
         if self.transform == "mask":
-            img = frame.to_ndarray(format="bgr24")#, width=640, height=320)
+            img = frame.to_ndarray(format="rgb24")#, width=640, height=320)
 
             if self.framecnt % 6 == 0:
-                self.results = mask_model(img, size=640)
+                self.predict = (mask_model(img, size=640).pandas().xyxy[-1]).values.tolist()
+                self.predict = nms(self.predict)
                 self.framecnt = 0
             self.framecnt += 1
 
-            img = plot_boxes(self.results.pandas().xyxy[-1], img)
+            img = plot_boxes(self.predict, img)
 
             # rebuild a VideoFrame, preserving timing information
-            new_frame = VideoFrame.from_ndarray(img, format="bgr24")
+            new_frame = VideoFrame.from_ndarray(img, format="rgb24")
             new_frame.pts = frame.pts
             new_frame.time_base = frame.time_base
             return new_frame
